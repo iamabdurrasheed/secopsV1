@@ -78,31 +78,40 @@ FIELD_ENV_MAP = {
 
 def load_azure_env() -> dict:
     """
-    Load Azure Blob Storage credentials from the root .env (already loaded into
-    os.environ by dotenv at module startup). Returns Azure vars so they can be
-    injected into docker run as -e flags.
+    Load Azure Blob Storage credentials from the root .env.
+    Only AZURE_STORAGE_CONNECTION_STRING and AZURE_CONTAINER_NAME are required.
     """
+    logger.info("[AZURE] ── Checking Azure Blob Storage credentials ──────────────")
+
     result = {}
 
-    def present(value: str | None) -> bool:
-        return bool(value and not value.startswith("your_"))
+    conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    container = os.environ.get("AZURE_CONTAINER_NAME", "").strip()
 
-    for key in (
-        "AZURE_STORAGE_ACCOUNT",
-        "AZURE_STORAGE_KEY",
-        "AZURE_CONTAINER_NAME",
-        "AZURE_STORAGE_CONNECTION_STRING",
-        "AZURE_STORAGE_CONTAINER",
-    ):
-        value = os.environ.get(key)
-        if present(value):
-            result[key] = value
+    # Check connection string
+    if not conn_str:
+        logger.warning("[AZURE]   AZURE_STORAGE_CONNECTION_STRING: NOT SET or EMPTY")
+    else:
+        logger.info(f"[AZURE]   AZURE_STORAGE_CONNECTION_STRING: SET (first 40 chars: {conn_str[:40]}...)")
+        result["AZURE_STORAGE_CONNECTION_STRING"] = conn_str
 
-    if "AZURE_STORAGE_CONTAINER" not in result and "AZURE_CONTAINER_NAME" in result:
-        result["AZURE_STORAGE_CONTAINER"] = result["AZURE_CONTAINER_NAME"]
+    # Check container name
+    if not container:
+        logger.warning("[AZURE]   AZURE_CONTAINER_NAME: NOT SET or EMPTY — will default to 'scan-results'")
+    else:
+        logger.info(f"[AZURE]   AZURE_CONTAINER_NAME: {container}")
+        result["AZURE_CONTAINER_NAME"] = container
+        result["AZURE_STORAGE_CONTAINER"] = container  # alias blob_storage.py also checks
 
-    if not result.get("AZURE_STORAGE_CONNECTION_STRING"):
-        logger.warning("AZURE_STORAGE_CONNECTION_STRING not set in root .env — Azure upload will be skipped")
+    # Final verdict
+    if not conn_str:
+        logger.warning("[AZURE] ✗ Upload will be SKIPPED — AZURE_STORAGE_CONNECTION_STRING is required")
+        logger.warning("[AZURE]   Set it in root .env:")
+        logger.warning("[AZURE]   AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net")
+    else:
+        logger.info(f"[AZURE] ✓ Upload ENABLED — container: {container or 'scan-results (default)'}")
+
+    logger.info("[AZURE] ────────────────────────────────────────────────────────")
     return result
 
 
@@ -117,12 +126,18 @@ def _write_azure_env_file(azure_env: dict, scan_job_id: str) -> str | None:
         return None
     import tempfile
     f = tempfile.NamedTemporaryFile(
-        mode="w", prefix=f"osi_azure_{scan_job_id}_", suffix=".env",
+        mode="w", encoding="utf-8", prefix=f"osi_azure_{scan_job_id}_", suffix=".env",
         delete=False, dir="/tmp"
     )
     for key, value in azure_env.items():
-        f.write(f"{key}={value}\n")
+        clean_value = value.strip()  # remove any accidental whitespace/newlines
+        f.write(f"{key}={clean_value}\n")
+        if key == "AZURE_STORAGE_CONNECTION_STRING":
+            logger.info(f"[{scan_job_id}] [AZURE] Written to env-file: {key} (length: {len(clean_value)} chars, first 40: {clean_value[:40]}...)")
+        else:
+            logger.info(f"[{scan_job_id}] [AZURE] Written to env-file: {key}={clean_value}")
     f.close()
+    logger.info(f"[{scan_job_id}] [AZURE] Temp env-file: {f.name}")
     return f.name
 
 
@@ -235,14 +250,38 @@ def run_docker_scan(payload: dict) -> None:
             docker_cmd,
             capture_output=True, text=True, cwd=PROJECT_ROOT,
         )
+        # Log all container stdout line by line, tagging Azure-related lines
         if result.stdout:
             for line in result.stdout.strip().splitlines():
-                logger.info(f"[{scan_job_id}] [container] {line}")
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in ("azure", "blob", "upload", "container", "storage")):
+                    if any(kw in line_lower for kw in ("error", "fail", "exception")):
+                        logger.error(f"[{scan_job_id}] [container][AZURE] {line}")
+                    elif any(kw in line_lower for kw in ("skip", "warn", "not set", "missing", "empty")):
+                        logger.warning(f"[{scan_job_id}] [container][AZURE] {line}")
+                    else:
+                        logger.info(f"[{scan_job_id}] [container][AZURE] {line}")
+                else:
+                    logger.info(f"[{scan_job_id}] [container] {line}")
+
+        # Always log stderr regardless of exit code so Azure errors are visible
+        if result.stderr:
+            for line in result.stderr.strip().splitlines():
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in ("azure", "blob", "upload", "storage")):
+                    logger.error(f"[{scan_job_id}] [container][AZURE][stderr] {line}")
+                else:
+                    logger.debug(f"[{scan_job_id}] [container][stderr] {line}")
+
         if result.returncode != 0:
-            logger.error(f"[{scan_job_id}] Docker error:\n{result.stderr[-2000:]}")
+            logger.error(f"[{scan_job_id}] Docker container exited with code {result.returncode}")
         else:
             logger.info(f"[{scan_job_id}] Scan completed successfully")
             logger.info(f"[{scan_job_id}] Results saved under: {host_base}/<commit-sha>/")
+            if not azure_env.get("AZURE_STORAGE_CONNECTION_STRING"):
+                logger.warning(f"[{scan_job_id}] [AZURE] Upload was SKIPPED — AZURE_STORAGE_CONNECTION_STRING not configured")
+            else:
+                logger.info(f"[{scan_job_id}] [AZURE] Upload attempted — check [container][AZURE] lines above for result")
     except subprocess.CalledProcessError as e:
         logger.error(f"[{scan_job_id}] Docker error: {e.stderr[-1000:]}")
     finally:
