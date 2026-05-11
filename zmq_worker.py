@@ -268,8 +268,12 @@ def run_docker_scan(payload: dict) -> None:
         if result.stderr:
             for line in result.stderr.strip().splitlines():
                 line_lower = line.lower()
-                if any(kw in line_lower for kw in ("azure", "blob", "upload", "storage")):
+                is_azure = any(kw in line_lower for kw in ("azure", "blob", "upload", "storage"))
+                is_error = any(kw in line_lower for kw in ("error", "fail", "exception"))
+                if is_azure and is_error:
                     logger.error(f"[{scan_job_id}] [container][AZURE][stderr] {line}")
+                elif is_azure:
+                    logger.info(f"[{scan_job_id}] [container][AZURE][stderr] {line}")
                 else:
                     logger.debug(f"[{scan_job_id}] [container][stderr] {line}")
 

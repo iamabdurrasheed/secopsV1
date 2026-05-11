@@ -33,7 +33,7 @@ class SCMService:
     @classmethod
     def get_latest_commit_github(cls, payload: ScanTriggerPayload) -> Optional[str]:
         headers = {}
-        if payload.auth_token and payload.is_private_repo:
+        if payload.auth_token:
             headers["Authorization"] = f"token {payload.auth_token}"
             
         repo_path = payload.repo_url.split("github.com/")[-1].removesuffix(".git")
